@@ -1,0 +1,459 @@
+{
+  // ============================================================================
+  // AWS Step Functions — State Machine Definition
+  // Amazon States Language (ASL) v1.0
+  //
+  // Name    : BRN Glue ETL State Machine
+  // Purpose : Orchestrate BRN (non-IPORT) Glue ETL jobs with file dependency
+  //           checking before job execution.
+  //
+  // High-Level Flow:
+  //   1. Check if required dependency files are already present in S3
+  //      → If YES (no dependencies): run StandaloneGlueJob directly
+  //      → If NO  (files missing)  : poll Lambda up to 3 times (with waits)
+  //                                  until files arrive, then run DependentGlueJob
+  //   2. Run the appropriate Glue job (Standalone or Dependent)
+  //   3. On success → invoke Lambda to record final job status
+  //   4. On Glue failure → invoke Lambda to record FAILED status + error details
+  //
+  // Input payload expected at execution start:
+  //   {
+  //     "file_name"            : "SOT_20250115.csv",    -- Primary file to process
+  //     "required_files"       : ["DEP1.csv","DEP2.csv"], -- Files that must exist first
+  //     "order_date"           : "2025-01-15",          -- Processing date
+  //     "job_name"             : "brn-sot-glue-job",    -- AWS Glue job name
+  //     "empty_required_files" : "true"/"false"         -- Pre-evaluated flag:
+  //                                                        "true"  = no dependencies (standalone)
+  //                                                        "false" = dependencies exist (check first)
+  //   }
+  //
+  // Timeout: 50400 seconds = 14 hours (covers overnight batch windows)
+  //
+  // Lambda used: brn-glue-job-orchestrator
+  //   - File check mode   : returns { status_code: 200 } when all required files present
+  //   - Status record mode: called after job completes to log run result
+  //   - Failure mode      : called on Glue error to log FAILED + error details
+  // ============================================================================
+
+  "Comment": "BRN Glue ETL State Machine",
+  "StartAt": "Check Required files",
+  "Version": "1.0",
+
+  // Global timeout: 14 hours — if the entire state machine hasn't finished
+  // within this window, it will fail with States.Timeout error.
+  // This prevents zombie executions from running indefinitely if files never arrive.
+  "TimeoutSeconds": 50400,
+
+  "States": {
+
+    // ==========================================================================
+    // STATE 1: Check Required files
+    // Type: Choice
+    //
+    // Decision gate at the start of every execution.
+    // Reads the pre-evaluated flag "empty_required_files" from the input payload.
+    //
+    // Why a pre-evaluated flag instead of checking S3 directly here:
+    //   Step Functions Choice states cannot call APIs. The flag is evaluated
+    //   BEFORE execution starts — typically by the Lambda or EventBridge rule
+    //   that triggers this state machine, based on whether required_files is
+    //   an empty list or not.
+    //
+    // Routing:
+    //   "true"  → No dependency files required → jump straight to StandaloneGlueJob
+    //   "false" → Dependency files required    → wait and check via Lambda polling
+    // ==========================================================================
+    "Check Required files": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          // If the calling system confirmed no required files are needed,
+          // skip all dependency polling and run the job immediately
+          "Variable": "$.empty_required_files",
+          "StringEquals": "true",
+          "Next": "StandaloneGlueJob"
+        }
+      ],
+      // Default: required files ARE needed — start the polling wait loop
+      "Default": "Wait Before Rechecking"
+    },
+
+    // ==========================================================================
+    // STATE 2: Wait Before Rechecking
+    // Type: Wait — 300 seconds (5 minutes)
+    //
+    // Initial wait before the first Lambda file-check poll.
+    // Gives the upstream source system time to deposit files in S3
+    // after the state machine was triggered. Avoids an immediate
+    // check that would almost certainly fail right at job start time.
+    // ==========================================================================
+    "Wait Before Rechecking": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "TriggerLambdafirst"
+    },
+
+    // ==========================================================================
+    // STATE 3: TriggerLambdafirst
+    // Type: Task — Lambda invoke
+    //
+    // FIRST attempt: calls brn-glue-job-orchestrator Lambda to check whether
+    // all required dependency files have landed in S3.
+    //
+    // Lambda receives:
+    //   file_name      : primary file to process
+    //   required_files : list of dependency files to check for
+    //   order_date     : processing date
+    //   job_name       : Glue job to eventually trigger
+    //
+    // Lambda response stored in $.lambdaresult
+    // Expected Lambda response: { "status_code": 200, "required_files": [...] }
+    //   status_code 200 = all required files present → proceed to DependentGlueJob
+    //   any other code  = files still missing         → wait again
+    // ==========================================================================
+    "TriggerLambdafirst": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "brn-glue-job-orchestrator",
+        "Payload": {
+          // Pass all orchestration context from the execution input to Lambda
+          "file_name.$":       "$.file_name",
+          "required_files.$":  "$.required_files",
+          "order_date.$":      "$.order_date",
+          "job_name.$":        "$.job_name"
+          // Note: Send_sns NOT set here — no alert on first check failure
+        }
+      },
+      // Store Lambda's full response under $.lambdaresult
+      // Does not overwrite the original input ($ remains intact)
+      "ResultPath": "$.lambdaresult",
+      "Next": "CheckResultFromLambda"
+    },
+
+    // ==========================================================================
+    // STATE 4: CheckResultFromLambda
+    // Type: Choice
+    //
+    // Evaluates Lambda's response from the first file check attempt.
+    //
+    // Routing:
+    //   status_code == 200 → Files found! Proceed to DependentGlueJob
+    //   anything else      → Files still missing → enter second wait loop
+    // ==========================================================================
+    "CheckResultFromLambda": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          // 200 = Lambda confirmed all required files exist in S3
+          "Variable": "$.lambdaresult.Payload.status_code",
+          "NumericEquals": 200,
+          "Next": "DependentGlueJob"
+        }
+      ],
+      // Files still not available after first check → wait longer, try again
+      "Default": "Waitseconditeration"
+    },
+
+    // ==========================================================================
+    // STATE 5: Waitseconditeration
+    // Type: Wait — 600 seconds (10 minutes)
+    //
+    // Longer wait before the second Lambda check.
+    // Extended wait (vs. 5 min initial) gives more time for slower upstream
+    // file delivery systems. If files haven't arrived in 10 more minutes,
+    // an SNS alert will be sent on the second Lambda invocation.
+    // ==========================================================================
+    "Waitseconditeration": {
+      "Type": "Wait",
+      "Seconds": 600,
+      "Next": "TriggerLambdaSecond"
+    },
+
+    // ==========================================================================
+    // STATE 6: TriggerLambdaSecond
+    // Type: Task — Lambda invoke
+    //
+    // SECOND attempt: same file check as TriggerLambdafirst but with
+    // "Send_sns": "true" — Lambda will publish an SNS notification alerting
+    // the ops team that the dependent files are still missing after the
+    // initial wait window. Useful for on-call alerting.
+    //
+    // NOTE: FunctionName uses 'arn:' prefix in source (likely a typo —
+    //       should be 'brn-glue-job-orchestrator' to match other states)
+    // ==========================================================================
+    "TriggerLambdaSecond": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        // TODO: Verify this ARN — appears to be a partial ARN (missing region/account)
+        //       Should likely be: "brn-glue-job-orchestrator" (same as other states)
+        "FunctionName": "arn:glue-job-orchestrator",
+        "Payload": {
+          "file_name.$":       "$.file_name",
+          "required_files.$":  "$.required_files",
+          "order_date.$":      "$.order_date",
+          "job_name.$":        "$.job_name",
+          // Trigger SNS alert on this second check — ops team notified files are late
+          "Send_sns": "true"
+        }
+      },
+      "ResultPath": "$.lambdaresult",
+      "Next": "CheckResultFromLambdaSecondTime"
+    },
+
+    // ==========================================================================
+    // STATE 7: CheckResultFromLambdaSecondTime
+    // Type: Choice
+    //
+    // Evaluates Lambda's response from the second file check attempt.
+    //
+    // Routing:
+    //   status_code == 200 → Files found! Proceed to DependentGlueJob
+    //   anything else      → Still missing → enter third (final) wait loop
+    // ==========================================================================
+    "CheckResultFromLambdaSecondTime": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.lambdaresult.Payload.status_code",
+          "NumericEquals": 200,
+          "Next": "DependentGlueJob"
+        }
+      ],
+      // After two failed checks → final 5-minute wait, then third Lambda call
+      "Default": "Waitthirditeration"
+    },
+
+    // ==========================================================================
+    // STATE 8: Waitthirditeration
+    // Type: Wait — 300 seconds (5 minutes)
+    //
+    // Third and final wait before the last file-check attempt.
+    // After this, TriggerlambdaThird loops back to CheckResultFromLambdaSecondTime
+    // — if files still don't arrive, the state machine will continue looping
+    // between Waitthirditeration → TriggerlambdaThird indefinitely
+    // until the global TimeoutSeconds (14 hours) is reached.
+    //
+    // NOTE: Consider adding a counter + fail state to cap retries explicitly.
+    // ==========================================================================
+    "Waitthirditeration": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "TriggerlambdaThird"
+    },
+
+    // ==========================================================================
+    // STATE 9: TriggerlambdaThird
+    // Type: Task — Lambda invoke
+    //
+    // THIRD (and subsequent) attempt: checks for files again.
+    // Loops back to CheckResultFromLambdaSecondTime on completion —
+    // this creates an indefinite retry loop until:
+    //   a) Files arrive (status_code 200 → DependentGlueJob), OR
+    //   b) The 14-hour global timeout fires (States.Timeout)
+    //
+    // Note: Send_sns NOT included — SNS was already sent on second attempt.
+    // ==========================================================================
+    "TriggerlambdaThird": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "brn-glue-job-orchestrator",
+        "Payload": {
+          "file_name.$":       "$.file_name",
+          "required_files.$":  "$.required_files",
+          "order_date.$":      "$.order_date",
+          "job_name.$":        "$.job_name"
+        }
+      },
+      "ResultPath": "$.lambdaresult",
+      // Loop back to the second-check Choice state — creates a continuous
+      // retry cycle: Wait(5min) → Lambda → Check → Wait(5min) → Lambda → ...
+      "Next": "CheckResultFromLambdaSecondTime"
+    },
+
+    // ==========================================================================
+    // STATE 10: DependentGlueJob
+    // Type: Task — Glue startJobRun (SYNCHRONOUS)
+    //
+    // Runs when all required dependency files are confirmed present in S3.
+    // Uses .sync integration — Step Functions WAITS for the Glue job to
+    // complete before proceeding (unlike fire-and-forget async invocation).
+    //
+    // Glue job receives:
+    //   --filename       : primary file to process
+    //   --orderdate      : processing date
+    //   --required_files : list of dependency files (from Lambda's payload)
+    //                      allows the Glue job to know which files to load
+    //
+    // On SUCCESS → CheckDependentJobStatus (record final status)
+    // On FAILURE → HandleGlueJobFailure (record error + notify)
+    // ==========================================================================
+    "DependentGlueJob": {
+      "Type": "Task",
+      // .sync = synchronous integration — state machine waits for Glue job to finish
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        // JobName is dynamic — taken from execution input, allowing one state
+        // machine definition to orchestrate multiple different Glue jobs
+        "JobName.$": "$.job_name",
+        "Arguments": {
+          "--filename.$":       "$.file_name",
+          "--orderdate.$":      "$.order_date",
+          // Pass the resolved list of required files from Lambda's last response
+          // so the Glue job knows exactly which dependency files are ready
+          "--required_files.$": "$.lambdaresult.Payload.required_files"
+        }
+      },
+      "InputPath": "$",
+      // Store Glue job run result (includes JobRunState: SUCCEEDED/FAILED/etc.)
+      "ResultPath": "$.dependentJobtaskresult",
+      "Catch": [
+        {
+          // Catch ALL Glue errors (States.ALL covers task failures, timeouts, etc.)
+          // ErrorEquals: ["States.ALL"] is a catch-all — consider being more specific
+          // (e.g., ["Glue.AmazonGlueException"]) for better error discrimination
+          "ErrorEquals": ["States.ALL"],
+          // Preserve error details under $.glueError for downstream logging
+          "ResultPath": "$.glueError",
+          "Next": "HandleGlueJobFailure"
+        }
+      ],
+      "Next": "CheckDependentJobStatus"
+    },
+
+    // ==========================================================================
+    // STATE 11: CheckDependentJobStatus
+    // Type: Task — Lambda invoke
+    //
+    // Post-run status recorder for the DependentGlueJob path.
+    // Calls brn-glue-job-orchestrator Lambda with the Glue job's final
+    // run state (SUCCEEDED, STOPPED, etc.) to log it in the audit/status table.
+    //
+    // This is a terminal state (End: true).
+    //
+    // NOTE: FunctionName uses 'brn:' prefix — likely a typo.
+    //       Should be 'brn-glue-job-orchestrator' (hyphen, not colon).
+    // ==========================================================================
+    "CheckDependentJobStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        // TODO: Fix typo — 'brn:glue-job-orchestrator' should be 'brn-glue-job-orchestrator'
+        "FunctionName": "brn:glue-job-orchestrator",
+        "Payload": {
+          "order_date.$": "$.order_date",
+          "job_name.$":   "$.job_name",
+          // Pass the Glue job's final state (e.g., "SUCCEEDED") for audit logging
+          "status.$":     "$.dependentJobtaskresult.JobRunState"
+        }
+      },
+      "ResultPath": "$.statusCheckResult",
+      // Terminal state — no further transitions
+      "End": true
+    },
+
+    // ==========================================================================
+    // STATE 12: StandaloneGlueJob
+    // Type: Task — Glue startJobRun (SYNCHRONOUS)
+    //
+    // Runs when empty_required_files = "true" — no dependency files needed.
+    // Job runs immediately with just the primary file and order date.
+    //
+    // Key difference from DependentGlueJob:
+    //   - No --required_files argument (no dependencies to pass through)
+    //   - Triggered directly from the initial Choice state (no polling loop)
+    //
+    // On SUCCESS → CheckStandaloneJobStatus
+    // On FAILURE → HandleGlueJobFailure
+    // ==========================================================================
+    "StandaloneGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.job_name",
+        "Arguments": {
+          "--filename.$":  "$.file_name",
+          "--orderdate.$": "$.order_date"
+          // No --required_files — this job has no upstream file dependencies
+        }
+      },
+      "InputPath": "$",
+      "ResultPath": "$.dependentJobtaskresult",
+      "Catch": [
+        {
+          // Catch all Glue errors and route to failure handler
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.glueError",
+          "Next": "HandleGlueJobFailure"
+        }
+      ],
+      "Next": "CheckStandaloneJobStatus"
+    },
+
+    // ==========================================================================
+    // STATE 13: CheckStandaloneJobStatus
+    // Type: Task — Lambda invoke
+    //
+    // Post-run status recorder for the StandaloneGlueJob path.
+    // Identical in purpose to CheckDependentJobStatus — records final Glue
+    // job run state in the audit/tracking system via Lambda.
+    //
+    // Terminal state (End: true).
+    // ==========================================================================
+    "CheckStandaloneJobStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "brn-glue-job-orchestrator",
+        "Payload": {
+          "order_date.$": "$.order_date",
+          "job_name.$":   "$.job_name",
+          // Final Glue job run state for audit logging
+          "status.$":     "$.dependentJobtaskresult.JobRunState"
+        }
+      },
+      "ResultPath": "$.statusCheckResult",
+      "End": true
+    },
+
+    // ==========================================================================
+    // STATE 14: HandleGlueJobFailure
+    // Type: Task — Lambda invoke
+    //
+    // Failure handler — reached whenever either Glue job (Standalone or Dependent)
+    // throws any error (caught by the "States.ALL" Catch blocks above).
+    //
+    // Calls brn-glue-job-orchestrator Lambda with:
+    //   status : "FAILED" (hardcoded — not dynamic, since this is always a failure path)
+    //   error  : full error object from $.glueError (contains error type + cause)
+    //
+    // The Lambda is expected to:
+    //   - Log the failure in the audit/status table
+    //   - Optionally trigger SNS/PagerDuty alert for the ops team
+    //
+    // Terminal state (End: true).
+    // ==========================================================================
+    "HandleGlueJobFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "brn-glue-job-orchestrator",
+        "Payload": {
+          "order_date.$": "$.order_date",
+          "job_name.$":   "$.job_name",
+          // Hardcoded FAILED status — this state is only reached on Glue job errors
+          "status": "FAILED",
+          // Pass the full error context (type + cause) from the Catch block
+          // $.glueError contains: { "Error": "...", "Cause": "..." }
+          "error.$": "$.glueError"
+        }
+      },
+      "ResultPath": "$.statusCheckResult",
+      // Terminal state — execution ends here after logging the failure
+      "End": true
+    }
+
+  }
+}
