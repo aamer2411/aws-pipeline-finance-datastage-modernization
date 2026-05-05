@@ -2,7 +2,6 @@
 # BRNORC127.py
 #
 # Glue Job    : BRNORC127 (BRN Oracle Extract — PageNumber File Generator)
-# Author      : Ravi Gupta
 #
 # Purpose:
 #   Connects to the production Oracle TLM database (tlmadmin schema) via JDBC,
