@@ -1,0 +1,31 @@
+{
+  "_comment": "DB2 JDBC connection configuration for BRNETL-UD070 Glue job.",
+  "_note": "Loaded at runtime via load_config(). KMS key used for S3 output encryption.",
+
+  "eng": {
+    "jdbc_url":          "jdbc:db2://<db2-host-eng>:<port>/<db>:sslConnection=true;",
+    "jdbc_driver_name":  "com.ibm.db2.jcc.DB2Driver",
+    "kms_key":           "arn:aws:kms:us-east-1:<account-id-eng>:key/<kms-key-id-eng>",
+    "default_bucket":    "institutional-eng-us-east-1-brn-etl-s3-source",
+    "default_folder":    "Intermediate/",
+    "db_schema":         "AINS00"
+  },
+
+  "test": {
+    "jdbc_url":          "jdbc:db2://<db2-host-test>:<port>/<db>:sslConnection=true;",
+    "jdbc_driver_name":  "com.ibm.db2.jcc.DB2Driver",
+    "kms_key":           "arn:aws:kms:us-east-1:<account-id-test>:key/<kms-key-id-test>",
+    "default_bucket":    "institutional-test-us-east-1-brn-etl-s3-source",
+    "default_folder":    "Intermediate/",
+    "db_schema":         "AINS00"
+  },
+
+  "prod": {
+    "jdbc_url":          "jdbc:db2://<db2-host-prod>:<port>/<db>:sslConnection=true;",
+    "jdbc_driver_name":  "com.ibm.db2.jcc.DB2Driver",
+    "kms_key":           "arn:aws:kms:us-east-1:<account-id-prod>:key/<kms-key-id-prod>",
+    "default_bucket":    "institutional-prod-us-east-1-brn-etl-s3-source",
+    "default_folder":    "Intermediate/",
+    "db_schema":         "AINS00"
+  }
+}
