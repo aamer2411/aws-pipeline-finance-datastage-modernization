@@ -3,7 +3,6 @@
 #
 # Glue Job Name  : BRNETL-UD041
 # DataStage Job  : CUST_0036_DC_DISB_CHK_EXC (Sequence + Parallel + Common + SOC jobs)
-# Author         : [redacted]
 #
 # Purpose:
 #   AWS Glue modernization of the DataStage CUST_0036_DC_DISB_CHK_EXC sequence job.
