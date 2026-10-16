@@ -211,7 +211,7 @@ A shared utility module (`Glue_Utils.py`) provides: Spark/GlueContext initializa
 | Files per job per day | 1.5 to 2 GB |
 | Reference files (ClientID, POID) | ~500 MB each |
 | Total per job per day | ~2 to 2.5 GB |
-| Total across ~110 Glue jobs | 200 to 250 GB/day |
+| Total across 100+ Glue jobs | 200 to 250 GB/day |
 
 ---
 

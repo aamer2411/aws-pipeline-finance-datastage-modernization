@@ -1,8 +1,8 @@
 # AWS DataStage Modernization
 
-Migration of IBM DataStage batch ETL pipelines to AWS for an Institutional Investor Group. Over 110 PySpark Glue jobs replace legacy DataStage sequences, with a fully event-driven orchestration layer built on S3, Lambda, Step Functions, and Redshift.
+Migration of IBM DataStage batch ETL pipelines to AWS for an Institutional Investor Group. Over 100 PySpark Glue jobs replace legacy DataStage sequences, with a fully event-driven orchestration layer built on S3, Lambda, Step Functions, and Redshift.
 
-This is production delivery work completed as part of a client engagement — scripts have been sanitized of credentials and internal identifiers before being shared here.
+This is production delivery work completed as part of a client engagement.
 
 ---
 
@@ -31,7 +31,7 @@ DataStage supports two major batch applications for Institutional Plan Sponsor r
 | Purpose | Financial data and money movement | Business reporting tool |
 | Sign-off requirement | 100% data match | 95% data match |
 | Sub-projects | BRD/BRN, CST/CTQ, OMG/PGX | Yearly, Quarterly, Monthly, Daily |
-| Glue jobs | ~110 | 7 builds |
+| Glue jobs | 100+ | 7 builds |
 | Daily data volume | 200-250 GB | Up to 33M records per cycle |
 
 ---
